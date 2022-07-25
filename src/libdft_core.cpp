@@ -550,8 +550,8 @@ void ins_inspect(INS ins) {
     // INT32 num_op = INS_OperandCount(ins);
     // INT32 ins_ext = INS_Extension(ins);
     // if (ins_ext != 0 && ins_ext != 10)
-    LOGD("[uninstrumented] opcode=%d, %s\n", ins_indx,
-         INS_Disassemble(ins).c_str());
+    // LOGD("[uninstrumented] opcode=%d, %s\n", ins_indx,
+    //      INS_Disassemble(ins).c_str());
     break;
   }
 }

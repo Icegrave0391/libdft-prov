@@ -15,7 +15,9 @@
 
 extern syscall_desc_t syscall_desc[SYSCALL_MAX];
 std::set<int> fuzzing_fd_set;
-static unsigned int stdin_read_off = 0;
+// static unsigned int stdin_read_off = 0;
+
+static unsigned int syscall_audit_seq_id = 0;
 static bool tainted = false;
 
 inline bool is_tainted() { return tainted; }
@@ -30,6 +32,20 @@ static inline void add_fuzzing_fd(int fd) {
 }
 
 static inline void remove_fuzzing_fd(int fd) { fuzzing_fd_set.erase(fd); }
+
+static inline bool should_track_fd(int fd) {
+  return fd != STDIN_FILENO && fd != STDOUT_FILENO && fd != STDERR_FILENO;
+}
+
+//
+enum {
+  SYSCALL_AUDIT_IN,
+  SYSCALL_AUDIT_OUT,
+};
+
+static inline void handle_syscall_taint(THREADID tid, syscall_ctx_t *ctx, const tag_t &tag) {
+  return;
+}
 
 /* __NR_open post syscall hook */
 static void post_open_hook(THREADID tid, syscall_ctx_t *ctx) {
@@ -88,6 +104,10 @@ static void post_close_hook(THREADID tid, syscall_ctx_t *ctx) {
   }
 }
 
+//
+// Auditing-input SYSCALLS: read, pread64, recvfrom, recv -----------------------------------------------------------------------------
+//
+
 static void post_read_hook(THREADID tid, syscall_ctx_t *ctx) {
   /* read() was not successful; optimized branch */
   const size_t nr = ctx->ret;
@@ -97,40 +117,24 @@ static void post_read_hook(THREADID tid, syscall_ctx_t *ctx) {
   const int fd = ctx->arg[SYSCALL_ARG0];
   const ADDRINT buf = ctx->arg[SYSCALL_ARG1];
   size_t count = ctx->arg[SYSCALL_ARG2];
-
-  /* taint-source */
-  if (is_fuzzing_fd(fd)) {
+  
+  /* add taint-source */
+  if (should_track_fd(fd)) {
     tainted = true;
-
-    unsigned int read_off = 0;
-    if (fd == STDIN_FILENO) {
-      // maintain it by ourself
-      read_off = stdin_read_off;
-      stdin_read_off += nr;
-    } else {
-      // low-level POSIX file descriptor I/O.
-      read_off = lseek(fd, 0, SEEK_CUR);
-      read_off -= nr; // post
-    }
-
-    LOGD("[read] fd: %d, addr: %p, offset: %d, size: %lu / %lu\n", fd,
-         (char *)buf, read_off, nr, count);
-
     /* set the tag markings */
-    // Attn: use count replace nr
-    // But count may be very very large!
+    // Attn: use count replace nr, but count may be very very large!
     if (count > nr + 32) {
       count = nr + 32;
     }
-
-    for (unsigned int i = 0; i < count; i++) {
-      tag_t t = tag_alloc<tag_t>(read_off + i);
-      tagmap_setb(buf + i, t);
-      // LOGD("[read] %d, lb: %d,  %s\n", i, t, tag_sprint(t).c_str());
-    }
-
+    LOGD("[read] fd: %d, addr: %p, size: %lu / %lu\n", fd,
+         (char *)buf, nr, count);
+    tag_t t = tag_alloc<tag_t>(syscall_audit_seq_id);    
+    tagmap_setn(buf, count, t);
+    LOGD("[read][set] %s\n", tag_sprint(t).c_str());
+    handle_syscall_taint(tid, ctx, t);
+    syscall_audit_seq_id += 1;
+    /* set the taint tag of return register */
     tagmap_setb_reg(tid, DFT_REG_RAX, 0, BDD_LEN_LB);
-
   } else {
     /* clear the tag markings */
     tagmap_clrn(buf, nr);
@@ -145,23 +149,72 @@ static void post_pread64_hook(THREADID tid, syscall_ctx_t *ctx) {
   const int fd = ctx->arg[SYSCALL_ARG0];
   const ADDRINT buf = ctx->arg[SYSCALL_ARG1];
   size_t count = ctx->arg[SYSCALL_ARG2];
-  const unsigned int read_off = ctx->arg[SYSCALL_ARG3];
 
-  if (is_fuzzing_fd(fd)) {
+  if (should_track_fd(fd)) {
     tainted = true;
-    LOGD("[pread64] fd: %d, offset: %d, size: %lu / %lu\n", fd, read_off, nr,
+    LOGD("[pread64] fd: %d, size: %lu / %lu\n", fd, nr,
          count);
     if (count > nr + 32) {
       count = nr + 32;
     }
     /* set the tag markings */
-    for (unsigned int i = 0; i < count; i++) {
-      tag_t t = tag_alloc<tag_t>(read_off + i);
-      tagmap_setb(buf + i, t);
-    }
+    tag_t t = tag_alloc<tag_t>(syscall_audit_seq_id);
+    tagmap_setn(buf, count, t);
+    LOGD("[pread64][set] %s\n", tag_sprint(t).c_str());
+    syscall_audit_seq_id += 1;
   } else {
     /* clear the tag markings */
     tagmap_clrn(buf, count);
+  }
+}
+
+/* __NR_recvfrom post syscall hook */
+static void post_recvfrom_hook(THREADID tid, syscall_ctx_t *ctx) {
+  const size_t nr = ctx->ret;
+  if (unlikely(nr <= 0))
+    return;
+  const int fd = ctx->arg[SYSCALL_ARG0];
+  const ADDRINT buf = ctx->arg[SYSCALL_ARG1];
+  size_t count = ctx->arg[SYSCALL_ARG2];
+
+  if (should_track_fd(fd)) {
+    tainted = true;
+    LOGD("[recvfrom] fd: %d, size: %lu / %lu\n", fd, nr,
+         count);
+    if (count > nr + 32) {
+      count = nr + 32;
+    }
+    /* set the tag markings */
+    tag_t t = tag_alloc<tag_t>(syscall_audit_seq_id);
+    tagmap_setn(buf, count, t);
+    LOGD("[recvfrom][set] %s\n", tag_sprint(t).c_str());
+    syscall_audit_seq_id += 1;
+  } else {
+    /* clear the tag markings */
+    tagmap_clrn(buf, count);
+  }
+}
+
+/* ssize_t write(int fd, const void *buf, size_t count); */
+static void post_write_hook(THREADID tid, syscall_ctx_t *ctx) {
+  const size_t nr = ctx->ret;
+  if (unlikely(nr <= 0))
+    return;
+  
+  const int fd = ctx->arg[SYSCALL_ARG0];
+  const ADDRINT buf = ctx->arg[SYSCALL_ARG1];
+  size_t count = ctx->arg[SYSCALL_ARG2];
+
+  /* consume taint-source */
+  if (should_track_fd(fd)) {
+    if (count > nr + 32) {
+      count = nr + 322;
+    }
+    /* get the taint markings */
+    LOGD("[write] fd: %d, addr: %p, size: %lu / %lu\n", fd, (char *)buf, nr, count);
+    tag_t t = tagmap_getn(buf, count);
+    LOGD("[write][get] %s\n", tag_sprint(t).c_str());
+    syscall_audit_seq_id += 1;
   }
 }
 
@@ -204,15 +257,20 @@ static void post_munmap_hook(THREADID tid, syscall_ctx_t *ctx) {
 }
 
 void hook_file_syscall() {
+  /* fd operation syscalls */
   (void)syscall_set_post(&syscall_desc[__NR_open], post_open_hook);
   (void)syscall_set_post(&syscall_desc[__NR_openat], post_openat_hook);
   (void)syscall_set_post(&syscall_desc[__NR_dup], post_dup_hook);
   (void)syscall_set_post(&syscall_desc[__NR_dup2], post_dup2_hook);
   (void)syscall_set_post(&syscall_desc[__NR_dup3], post_dup2_hook);
   (void)syscall_set_post(&syscall_desc[__NR_close], post_close_hook);
-
-  (void)syscall_set_post(&syscall_desc[__NR_read], post_read_hook);
-  (void)syscall_set_post(&syscall_desc[__NR_pread64], post_pread64_hook);
+  /* memory operation syscalls */
   (void)syscall_set_post(&syscall_desc[__NR_mmap], post_mmap_hook);
   (void)syscall_set_post(&syscall_desc[__NR_munmap], post_munmap_hook);
+  /* audit-in syscalls */
+  (void)syscall_set_post(&syscall_desc[__NR_read], post_read_hook);
+  (void)syscall_set_post(&syscall_desc[__NR_pread64], post_pread64_hook);
+  (void)syscall_set_post(&syscall_desc[__NR_recvfrom], post_recvfrom_hook);
+  /* audit-out syscalls */
+  (void)syscall_set_post(&syscall_desc[__NR_write], post_write_hook);
 }
