@@ -35,6 +35,7 @@
 #include "pin.H"
 #include "syscall_desc.h"
 #include "syscall_hook.h"
+#include "fdmap.h"
 
 #include <iostream>
 #include <stdio.h>
@@ -125,6 +126,10 @@ bool FollowChild(CHILD_PROCESS cProcess, VOID* userData) {
   return true;
 }
 
+void fini(INT32 code, VOID* v) {
+  fprintf(stdout, "OVER!\n");
+}
+
 int main(int argc, char **argv) {
   /* initialize symbol processing */
   PIN_InitSymbols();
@@ -140,6 +145,7 @@ int main(int argc, char **argv) {
     goto err;
 
   hook_file_syscall();
+  PIN_AddFiniFunction(fini, 0);
   // Register a notification handler that is called when the application
   // forks a new process.
   PIN_AddForkFunction(FPOINT_BEFORE, BeforeFork, 0);

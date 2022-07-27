@@ -26,3 +26,4 @@ fi
 
 echo "Executing with libdft -- $EXEC"
 $PIN -follow_execv -t $LIBDFT_DIR/tools/obj-intel64/$LIBDFT_EXEC -- $@
+#$PIN -follow_execv -pid 401724 -t $LIBDFT_DIR/tools/obj-intel64/$LIBDFT_EXEC

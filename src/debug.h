@@ -14,6 +14,11 @@
 #define LOGD(...)
 #endif
 
+#define LOGU(...)                                                               \
+  do {                                                                         \
+    printf(__VA_ARGS__);                                                       \
+  } while (0)
+
 #define LOGE(...)                                                              \
   do {                                                                         \
     fprintf(stderr, __VA_ARGS__);                                              \

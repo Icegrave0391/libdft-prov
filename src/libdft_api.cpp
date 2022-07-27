@@ -330,6 +330,7 @@ static inline int thread_ctx_init(void) {
 
   if (unlikely(threads_ctx == NULL)) {
     fprintf(stderr, "%s:%s:%u\n", __FILE__, __func__, __LINE__);
+    fprintf(stdout, "G!\n");
     /* failed */
     libdft_die();
     return 1;
@@ -409,6 +410,7 @@ void libdft_die(void) {
    * detach PIN from the application;
    * the application will continue to execute natively
    */
+  fprintf(stdout, "G!\n");
   PIN_Detach();
 }
 
