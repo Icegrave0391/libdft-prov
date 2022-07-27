@@ -7,14 +7,54 @@
 #include "tagmap.h"
 
 #include <iostream>
+#include <map>
 #include <set>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <linux/net.h>
 #include <unistd.h>
 
 #define FUZZING_INPUT_FILE "cur_input"
 
 extern syscall_desc_t syscall_desc[SYSCALL_MAX];
 std::set<int> fuzzing_fd_set;
+
+// /* socket related syscalls */
+// static int sock_syscalls[] = {
+// 	__NR_socket,
+// 	__NR_accept,
+// 	__NR_accept4,
+// 	__NR_getsockname,
+// 	__NR_getpeername,
+// 	__NR_socketpair,
+// 	__NR_recvfrom,
+// 	__NR_getsockopt,
+// 	__NR_recvmsg,
+// 	__NR_recvmmsg,
+// };
+
+std::map <int, std::string> create_map() {
+  std::map<int, std::string> m;
+  m[__NR_read] = "read";
+  m[__NR_pread64] = "pread64";
+  m[__NR_recvfrom] = "recvfrom";
+  m[__NR_write] = "write";
+  m[__NR_writev] = "writev";
+  return m;
+}
+std::map <int, std::string> audit_syscalls = create_map();
+
+// static std::map<int, std::string> audit_syscalls = {
+//   {__NR_read, "read"},
+//   {__NR_pread64, "pread64"},
+//   {__NR_write, "write"},
+//   {__NR_writev, "writev"},
+//   {__NR_socket, "socket"},
+//   {__NR_recvfrom, "recvfrom"},
+//   {__NR_recvmsg, "recvmsg"},
+//   {__NR_recvmmsg, "recvmmsg"}
+// };
+
 // static unsigned int stdin_read_off = 0;
 
 static unsigned int syscall_audit_seq_id = 0;
@@ -43,7 +83,79 @@ enum {
   SYSCALL_AUDIT_OUT,
 };
 
-static inline void handle_syscall_taint(THREADID tid, syscall_ctx_t *ctx, const tag_t &tag) {
+static inline void handle_syscall_taint(THREADID tid, syscall_ctx_t *ctx) {
+  // TODO() just padding here
+  // TODO() to be implemented
+  switch (ctx->nr) {
+    /* audit-input syscalls: set taint sources */
+    case __NR_read:
+    case __NR_pread64:
+    case __NR_recvfrom:
+    {
+      const int fd = ctx->arg[SYSCALL_ARG0];
+      const ADDRINT buf = ctx->arg[SYSCALL_ARG1];
+      size_t count = ctx->arg[SYSCALL_ARG2];
+      size_t ret = ctx->ret;
+      if (unlikely((int)ret == -1))
+        return;
+      
+      if (should_track_fd(fd)) {
+        tainted = true;
+        // std::string sysname = audit_syscalls.at(ctx->nr);
+        auto it = audit_syscalls.find(ctx->nr);
+        if (it == audit_syscalls.end()) {
+          return;
+        }
+        std::string sysname = it->second;
+
+        LOGD("[%s] fd: %d, addr: %p, size: %lu / %lu pid: %d\n", sysname.c_str(),
+             fd, (char *)buf, ret, count, getpid());
+        tag_t t = tag_alloc<tag_t>(syscall_audit_seq_id);    
+        tagmap_setn(buf, count, t);
+        LOGD("[%s][set] %s\n", sysname.c_str(), tag_sprint(t).c_str());
+      } else {
+        tagmap_clrn(buf, ret);
+      }
+      syscall_audit_seq_id += 1;
+      break;
+    }
+    case __NR_write:
+    case __NR_writev: /* ssize_t writev(int fd, const struct iovec *iov, int iovcnt); */
+    { 
+      const int fd = ctx->arg[SYSCALL_ARG0];
+      size_t ret = ctx->ret;
+      if (unlikely((int)ret == -1 || !should_track_fd(fd)))
+        return;
+      if (ctx->nr == __NR_write) {
+        /* write() */
+        const ADDRINT buf = ctx->arg[SYSCALL_ARG1];
+        const size_t count = ctx->arg[SYSCALL_ARG2];
+        LOGD("[write] fd: %d, addr: %p, size: %lu / %lu pid: %d\n", fd, (char *)buf, ret, count, getpid());
+        tag_t t = tagmap_getn(buf, ret);
+        LOGD("[write][get] %s\n", tag_sprint(t).c_str());
+      } else {
+        /* writev() */
+        const struct iovec *iov_array = (struct iovec *)ctx->arg[SYSCALL_ARG1];
+        const struct iovec *iov;
+        size_t iov_tot;
+        const int iovcnt = ctx->arg[SYSCALL_ARG2];
+        
+        tag_t ts = tag_traits<tag_t>::cleared_val;
+        for (int i = 0; i < iovcnt; i++) {
+          iov = &iov_array[i];
+          iov_tot = (ret > (size_t)iov->iov_len) ? (size_t)iov->iov_len : ret;
+          tag_t t = tagmap_getn((ADDRINT)iov->iov_base, iov_tot);
+          ts = tag_combine(ts, t);
+        }  
+        LOGD("[writev] fd: %d, addr: %p, size: %lu, pid: %d\n", fd, (char *)iov_array, ret, getpid());
+        LOGD("[writev][get] %s\n", tag_sprint(ts).c_str());
+      }
+      syscall_audit_seq_id += 1;
+      break;
+    }
+    default:
+      break;
+  }
   return;
 }
 
@@ -104,118 +216,79 @@ static void post_close_hook(THREADID tid, syscall_ctx_t *ctx) {
   }
 }
 
+/*
+ * socketcall(2) handler
+ *
+ * attach taint-sources in the following
+ * syscalls:
+ * 	socket(2), accept(2), recv(2),
+ * 	recvfrom(2), recvmsg(2)
+ *
+ * everything else is left intact in order
+ * to avoid taint-leaks
+ */
+// static void post_socketcall_hook(THREADID tid, syscall_ctx_t *ctx) {
+//   /* message header; recvmsg(2) */
+//   struct msghdr *msg;
+//   /* iov bytes copied; recvmsg(2) */
+//   size_t iov_tot;
+//   /* iterators */
+//   size_t i;
+//   struct iovec *iov;
+//   std::set<int>::iterator it;
+//   /* total bytes received */
+//   size_t tot;
+//   /* arguments */
+//   unsigned long *args = (unsigned long *)ctx->arg[SYSCALL_ARG0];
+//   switch (ctx->nr)
+//   {
+//   case __NR_recvfrom:  // ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, ...);
+//     if (unlikely((long)ctx->ret < 0))
+//       return;
+//     handle_syscall_taint(tid, ctx);
+//     break;
+
+//   case __NR_recvmsg:
+//     if (unlikely((long)ctx->ret < 0))
+//       return;
+    
+//   default:
+//     break;
+//   }
+// }
+
 //
 // Auditing-input SYSCALLS: read, pread64, recvfrom, recv -----------------------------------------------------------------------------
 //
 
 static void post_read_hook(THREADID tid, syscall_ctx_t *ctx) {
-  /* read() was not successful; optimized branch */
-  const size_t nr = ctx->ret;
-  if (unlikely(nr <= 0))
-    return;
-
-  const int fd = ctx->arg[SYSCALL_ARG0];
-  const ADDRINT buf = ctx->arg[SYSCALL_ARG1];
-  size_t count = ctx->arg[SYSCALL_ARG2];
-  
-  /* add taint-source */
-  if (should_track_fd(fd)) {
-    tainted = true;
-    /* set the tag markings */
-    // Attn: use count replace nr, but count may be very very large!
-    if (count > nr + 32) {
-      count = nr + 32;
-    }
-    LOGD("[read] fd: %d, addr: %p, size: %lu / %lu\n", fd,
-         (char *)buf, nr, count);
-    tag_t t = tag_alloc<tag_t>(syscall_audit_seq_id);    
-    tagmap_setn(buf, count, t);
-    LOGD("[read][set] %s\n", tag_sprint(t).c_str());
-    handle_syscall_taint(tid, ctx, t);
-    syscall_audit_seq_id += 1;
-    /* set the taint tag of return register */
-    tagmap_setb_reg(tid, DFT_REG_RAX, 0, BDD_LEN_LB);
-  } else {
-    /* clear the tag markings */
-    tagmap_clrn(buf, nr);
-  }
+  fprintf(stdout, "[read] fd: %ld\n", ctx->arg[SYSCALL_ARG0]);
+  handle_syscall_taint(tid, ctx);
 }
 
 /* __NR_pread64 post syscall hook */
 static void post_pread64_hook(THREADID tid, syscall_ctx_t *ctx) {
-  const size_t nr = ctx->ret;
-  if (unlikely(nr <= 0))
-    return;
-  const int fd = ctx->arg[SYSCALL_ARG0];
-  const ADDRINT buf = ctx->arg[SYSCALL_ARG1];
-  size_t count = ctx->arg[SYSCALL_ARG2];
-
-  if (should_track_fd(fd)) {
-    tainted = true;
-    LOGD("[pread64] fd: %d, size: %lu / %lu\n", fd, nr,
-         count);
-    if (count > nr + 32) {
-      count = nr + 32;
-    }
-    /* set the tag markings */
-    tag_t t = tag_alloc<tag_t>(syscall_audit_seq_id);
-    tagmap_setn(buf, count, t);
-    LOGD("[pread64][set] %s\n", tag_sprint(t).c_str());
-    syscall_audit_seq_id += 1;
-  } else {
-    /* clear the tag markings */
-    tagmap_clrn(buf, count);
-  }
+  LOGD("[pread] fd: %ld\n", ctx->arg[SYSCALL_ARG0]);
+  handle_syscall_taint(tid, ctx);
 }
 
 /* __NR_recvfrom post syscall hook */
 static void post_recvfrom_hook(THREADID tid, syscall_ctx_t *ctx) {
-  const size_t nr = ctx->ret;
-  if (unlikely(nr <= 0))
-    return;
-  const int fd = ctx->arg[SYSCALL_ARG0];
-  const ADDRINT buf = ctx->arg[SYSCALL_ARG1];
-  size_t count = ctx->arg[SYSCALL_ARG2];
-
-  if (should_track_fd(fd)) {
-    tainted = true;
-    LOGD("[recvfrom] fd: %d, size: %lu / %lu\n", fd, nr,
-         count);
-    if (count > nr + 32) {
-      count = nr + 32;
-    }
-    /* set the tag markings */
-    tag_t t = tag_alloc<tag_t>(syscall_audit_seq_id);
-    tagmap_setn(buf, count, t);
-    LOGD("[recvfrom][set] %s\n", tag_sprint(t).c_str());
-    syscall_audit_seq_id += 1;
-  } else {
-    /* clear the tag markings */
-    tagmap_clrn(buf, count);
-  }
+  handle_syscall_taint(tid, ctx);
 }
+
+//
+// Auditing-output SYSCALLS: write, writev -----------------------------------------------------------------------------
+//
 
 /* ssize_t write(int fd, const void *buf, size_t count); */
 static void post_write_hook(THREADID tid, syscall_ctx_t *ctx) {
-  const size_t nr = ctx->ret;
-  if (unlikely(nr <= 0))
-    return;
-  
-  const int fd = ctx->arg[SYSCALL_ARG0];
-  const ADDRINT buf = ctx->arg[SYSCALL_ARG1];
-  size_t count = ctx->arg[SYSCALL_ARG2];
+  handle_syscall_taint(tid, ctx);
+}
 
-  /* consume taint-source */
-  if (should_track_fd(fd)) {
-    if (count > nr + 32) {
-      count = nr + 322;
-    }
-    /* get the taint markings */
-    LOGD("[write] fd: %d, addr: %p, size: %lu / %lu\n", fd, (char *)buf, nr, count);
-    tag_t t = tagmap_getn(buf, count);
-    LOGD("[write][get] %s\n", tag_sprint(t).c_str());
-    syscall_audit_seq_id += 1;
-  }
+/* ssize_t writev(int fd, const struct iovec *iov, int iovcnt); */
+static void post_writev_hook(THREADID tid, syscall_ctx_t *ctx) {
+  handle_syscall_taint(tid, ctx);
 }
 
 // void *mmap(void *start, size_t length, int prot, int flags, int fd, off_t
@@ -273,4 +346,5 @@ void hook_file_syscall() {
   (void)syscall_set_post(&syscall_desc[__NR_recvfrom], post_recvfrom_hook);
   /* audit-out syscalls */
   (void)syscall_set_post(&syscall_desc[__NR_write], post_write_hook);
+  (void)syscall_set_post(&syscall_desc[__NR_writev], post_writev_hook);
 }

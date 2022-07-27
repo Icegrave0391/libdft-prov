@@ -36,14 +36,95 @@
 #include "syscall_desc.h"
 #include "syscall_hook.h"
 
+#include <iostream>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
+
+// Pin full path
+KNOB< std::string > KnobPinFullPath(KNOB_MODE_WRITEONCE, "pintool", "pin_path", "/home/chuqiz/local/pin/pin-3.20-98437-gf02b61307-gcc-linux/", "pin full path");
+// Tool full path
+KNOB< std::string > KnobToolsFullPath(KNOB_MODE_WRITEONCE, "pintool", "tools_path", "/home/chuqiz/GitHub/libdft64/tools/obj-intel64/", "grand parent tool full path");
+
+// Child configuration
+// Application name
+KNOB< std::string > KnobChildApplicationName(KNOB_MODE_WRITEONCE, "pintool", "child_app_name", "win_child_process",
+                                        "child application name");
+// PinTool name
+KNOB< std::string > KnobChildToolName(KNOB_MODE_WRITEONCE, "pintool", "child_tool_name", "libdft.so",
+                                 "child tool full path");
 
 /*
  * DummyTool (i.e, libdft)
  *
  * used for demonstrating libdft
  */
+
+pid_t parent_pid;
+PIN_LOCK pinLock;
+
+VOID BeforeFork(THREADID threadid, const CONTEXT* ctxt, VOID* arg)
+{
+    PIN_GetLock(&pinLock, threadid + 1);
+    std::cerr << "TOOL: Before fork." << std::endl;
+    PIN_ReleaseLock(&pinLock);
+    parent_pid = PIN_GetPid();
+}
+ 
+VOID AfterForkInParent(THREADID threadid, const CONTEXT* ctxt, VOID* arg)
+{
+    PIN_GetLock(&pinLock, threadid + 1);
+    std::cerr << "TOOL: After fork in parent." << std::endl;
+    PIN_ReleaseLock(&pinLock);
+ 
+    if (PIN_GetPid() != parent_pid)
+    {
+        std::cerr << "PIN_GetPid() fails in parent process" << std::endl;
+        exit(-1);
+    }
+}
+ 
+VOID AfterForkInChild(THREADID threadid, const CONTEXT* ctxt, VOID* arg)
+{
+    PIN_GetLock(&pinLock, threadid + 1);
+    std::cerr << "TOOL: After fork in child." << std::endl;
+    PIN_ReleaseLock(&pinLock);
+ 
+    if ((PIN_GetPid() == parent_pid) || (getppid() != parent_pid))
+    {
+        std::cerr << "PIN_GetPid() fails in child process" << std::endl;
+        exit(-1);
+    }
+}
+
+bool FollowChild(CHILD_PROCESS cProcess, VOID* userData) {
+  fprintf(stdout, "before child:%u\n", getpid());
+  // bool res;
+  int appArgc;
+  CHAR const* const* appArgv;
+  // OS_PROCESS_ID pid = CHILD_PROCESS_GetId(cProcess);
+
+  CHILD_PROCESS_GetCommandLine(cProcess, &appArgc, &appArgv);
+
+  // Set Pin's command line for child process
+  int pinArgc = 0;
+  const int pinArgcMax = 6;
+  char const* pinArgv[pinArgcMax];
+
+  std::string pin = KnobPinFullPath.Value() + "pin";
+  fprintf(stdout, "argv 0: %s\n", pin.c_str());
+  pinArgv[pinArgc++] = pin.c_str();
+  pinArgv[pinArgc++] = "-follow_execv";
+  pinArgv[pinArgc++] = "-t";
+  std::string tool = KnobToolsFullPath.Value() + KnobChildToolName.Value();
+  fprintf(stdout, "argv -follow-execv -t : %s\n", tool.c_str());
+  pinArgv[pinArgc++] = tool.c_str();
+  pinArgv[pinArgc++] = "--";
+
+  CHILD_PROCESS_SetPinCommandLine(cProcess, pinArgc, pinArgv);
+  return true;
+}
+
 int main(int argc, char **argv) {
   /* initialize symbol processing */
   PIN_InitSymbols();
@@ -59,14 +140,19 @@ int main(int argc, char **argv) {
     goto err;
 
   hook_file_syscall();
+  // Register a notification handler that is called when the application
+  // forks a new process.
+  PIN_AddForkFunction(FPOINT_BEFORE, BeforeFork, 0);
+  PIN_AddForkFunction(FPOINT_AFTER_IN_PARENT, AfterForkInParent, 0);
+  PIN_AddForkFunction(FPOINT_AFTER_IN_CHILD, AfterForkInChild, 0);
+  /* TODO(): add child hook */
+  PIN_AddFollowChildProcessFunction(FollowChild, 0);
   /* start Pin */
   PIN_StartProgram();
-
   /* typically not reached; make the compiler happy */
   return EXIT_SUCCESS;
 
 err: /* error handling */
-
   /* return */
   return EXIT_FAILURE;
 }
