@@ -3,7 +3,7 @@
 # intel-pin root location
 PIN_ROOT_PATH=/home/chuqiz/local/pin/pin-3.20-98437-gf02b61307-gcc-linux
 TOOLS_ROOT_PATH=$PIN_ROOT_PATH/source/tools
-LIBDFT_EXEC=libdft.so #libdft.so  # track.so
+LIBDFT_EXEC=nullpin.so #track.so #libdft.so  # track.so
 
 # tools
 PIN=/home/chuqiz/local/pin/pin-3.20-98437-gf02b61307-gcc-linux/pin
